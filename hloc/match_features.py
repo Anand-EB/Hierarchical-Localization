@@ -5,9 +5,16 @@ from pathlib import Path
 from queue import Queue
 from threading import Thread
 from typing import Dict, List, Optional, Tuple, Union
+import os
+
+# Avoid HDF5 file locking to prevent "file is already open" errors
+# from crashed runs or concurrent reads
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
 import h5py
 import torch
+import torch.distributed as dist
+from joblib import Parallel, delayed
 from tqdm import tqdm
 
 from . import logger, matchers
@@ -88,6 +95,33 @@ confs = {
 }
 
 
+def init_distributed():
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        if dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
+        dist.init_process_group(backend="nccl")
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        return rank, world_size
+    return 0, 1
+
+
+def check_pairs(pairs_chunk, existing_keys):
+    res = []
+    for i, j in pairs_chunk:
+        if (
+            names_to_pair(i, j) in existing_keys
+            or names_to_pair(j, i) in existing_keys
+            or names_to_pair_old(i, j) in existing_keys
+            or names_to_pair_old(j, i) in existing_keys
+        ):
+            continue
+        res.append((i, j))
+    return res
+
+
 class WorkQueue:
     def __init__(self, work_fn, num_threads=1):
         self.queue = Queue(num_threads)
@@ -141,6 +175,8 @@ class FeaturePairsDataset(torch.utils.data.Dataset):
 
 def writer_fn(inp, match_path):
     pair, pred = inp
+    # Use "r+" which is less aggressive than "a" regarding locks, or retry logic could be added
+    # But disabling locking via env var is the most effective fix for this specific error.
     with h5py.File(str(match_path), "a", libver="latest") as fd:
         if pair in fd:
             del fd[pair]
@@ -191,17 +227,37 @@ def find_unique_new_pairs(pairs_all: List[Tuple[str]], match_path: Path = None):
             pairs.add((i, j))
     pairs = list(pairs)
     if match_path is not None and match_path.exists():
-        with h5py.File(str(match_path), "r", libver="latest") as fd:
-            pairs_filtered = []
-            for i, j in pairs:
-                if (
-                    names_to_pair(i, j) in fd
-                    or names_to_pair(j, i) in fd
-                    or names_to_pair_old(i, j) in fd
-                    or names_to_pair_old(j, i) in fd
-                ):
-                    continue
-                pairs_filtered.append((i, j))
+        try:
+            with h5py.File(str(match_path), "r", libver="latest") as fd:
+                existing_keys = set(fd.keys())
+        except OSError:
+            logger.warning(
+                f"Could not open {match_path} (likely locked/corrupted). "
+                "Deleting and restarting."
+            )
+            match_path.unlink()
+            existing_keys = set()
+
+        # Parallel filtering using joblib
+        chunk_size = 10_000
+        if len(pairs) > chunk_size:
+            results = Parallel(n_jobs=-1, backend="threading")(
+                delayed(check_pairs)(pairs[i : i + chunk_size], existing_keys)
+                for i in range(0, len(pairs), chunk_size)
+            )
+            pairs_filtered = [p for res in results for p in res]
+            return pairs_filtered
+
+        pairs_filtered = []
+        for i, j in pairs:
+            if (
+                names_to_pair(i, j) in existing_keys
+                or names_to_pair(j, i) in existing_keys
+                or names_to_pair_old(i, j) in existing_keys
+                or names_to_pair_old(j, i) in existing_keys
+            ):
+                continue
+            pairs_filtered.append((i, j))
         return pairs_filtered
     return pairs
 
@@ -215,9 +271,16 @@ def match_from_paths(
     feature_path_ref: Path,
     overwrite: bool = False,
 ) -> Path:
-    logger.info(
-        "Matching local features with configuration:" f"\n{pprint.pformat(conf)}"
-    )
+    rank, world_size = init_distributed()
+    if world_size > 1:
+        match_path = match_path.parent / (
+            match_path.stem + f"_rank{rank}" + match_path.suffix
+        )
+
+    if rank == 0:
+        logger.info(
+            "Matching local features with configuration:" f"\n{pprint.pformat(conf)}"
+        )
 
     if not feature_path_q.exists():
         raise FileNotFoundError(f"Query feature file {feature_path_q}.")
@@ -228,9 +291,13 @@ def match_from_paths(
     assert pairs_path.exists(), pairs_path
     pairs = parse_retrieval(pairs_path)
     pairs = [(q, r) for q, rs in pairs.items() for r in rs]
+
+    if world_size > 1:
+        pairs = pairs[rank::world_size]
+
     pairs = find_unique_new_pairs(pairs, None if overwrite else match_path)
     if len(pairs) == 0:
-        logger.info("Skipping the matching.")
+        logger.info(f"Rank {rank}: Skipping the matching.")
         return
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -239,11 +306,16 @@ def match_from_paths(
 
     dataset = FeaturePairsDataset(pairs, feature_path_q, feature_path_ref)
     loader = torch.utils.data.DataLoader(
-        dataset, num_workers=5, batch_size=1, shuffle=False, pin_memory=True
+        dataset,
+        num_workers=5,
+        batch_size=1,
+        shuffle=False,
+        pin_memory=True,
+        # pre_fetch=16,
     )
     writer_queue = WorkQueue(partial(writer_fn, match_path=match_path), 5)
 
-    for idx, data in enumerate(tqdm(loader, smoothing=0.1)):
+    for idx, data in enumerate(tqdm(loader, smoothing=0.1, disable=rank != 0, desc=f"Rank {rank}")):
         data = {
             k: v if k.startswith("image") else v.to(device, non_blocking=True)
             for k, v in data.items()
@@ -252,7 +324,7 @@ def match_from_paths(
         pair = names_to_pair(*pairs[idx])
         writer_queue.put((pair, pred))
     writer_queue.join()
-    logger.info("Finished exporting matches.")
+    logger.info(f"Rank {rank}: Finished exporting matches.")
 
 
 if __name__ == "__main__":
