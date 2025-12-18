@@ -97,14 +97,17 @@ confs = {
 def init_distributed():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         if dist.is_initialized():
-            return dist.get_rank(), dist.get_world_size()
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            return rank, world_size, local_rank
         dist.init_process_group(backend="nccl")
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
-        return rank, world_size
-    return 0, 1
+        return rank, world_size, local_rank
+    return 0, 1, 0
 
 
 def check_pairs(pairs_chunk, existing_keys):
@@ -267,7 +270,7 @@ def match_from_paths(
     feature_path_ref: Path,
     overwrite: bool = False,
 ) -> Path:
-    rank, world_size = init_distributed()
+    rank, world_size, local_rank = init_distributed()
     
     # Store original match_path for consolidation later
     original_match_path = match_path
@@ -332,7 +335,7 @@ def match_from_paths(
 
     # Consolidate all rank files into a single file (rank 0 only)
     if world_size > 1:
-        dist.barrier()  # Wait for all ranks to finish
+        dist.barrier(device_ids=[local_rank])  # Wait for all ranks to finish
         
         if rank == 0:
             logger.info("Consolidating match files from all ranks...")

@@ -19,7 +19,7 @@ def create_empty_db(database_path: Path):
         pass
 
 @torch.no_grad()
-def export_database(export_path: Path):
+def main(export_path: Path):
     database = export_path / "database.db"
 
     logger.info(f"Writing COLMAP logs to {sfm_dir / 'colmap.LOG.*'}")
