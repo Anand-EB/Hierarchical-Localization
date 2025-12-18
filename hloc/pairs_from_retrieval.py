@@ -111,7 +111,7 @@ def main(
     # Avoid self-matching
     self = np.array(query_names)[:, None] == np.array(db_names)[None]
     pairs = pairs_from_score_matrix(sim, self, num_matched, min_score=0)
-    pairs = [(query_names[i], db_names[j]) for i, j in pairs]
+    pairs = set([(query_names[i], db_names[j]) for i, j in pairs])
 
     logger.info(f"Found {len(pairs)} pairs.")
     with open(output, "w") as f:

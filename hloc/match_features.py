@@ -1,6 +1,5 @@
 import argparse
 import pprint
-from functools import partial
 from pathlib import Path
 from queue import Queue
 from threading import Thread
@@ -122,29 +121,40 @@ def check_pairs(pairs_chunk, existing_keys):
     return res
 
 
-class WorkQueue:
-    def __init__(self, work_fn, num_threads=1):
-        self.queue = Queue(num_threads)
-        self.threads = [
-            Thread(target=self.thread_fn, args=(work_fn,)) for _ in range(num_threads)
-        ]
-        for thread in self.threads:
-            thread.start()
+class MatchWriter(Thread):
+    """Persistent HDF5 writer that keeps the file open for the lifetime of the thread."""
 
-    def join(self):
-        for thread in self.threads:
-            self.queue.put(None)
-        for thread in self.threads:
-            thread.join()
+    def __init__(self, match_path, queue_size=16):
+        super().__init__()
+        self.queue = Queue(maxsize=queue_size)
+        self.match_path = match_path
+        self.daemon = True
+        self.start()
 
-    def thread_fn(self, work_fn):
-        item = self.queue.get()
-        while item is not None:
-            work_fn(item)
-            item = self.queue.get()
+    def run(self):
+        # Keep file open for the lifetime of the thread to avoid repeated open/close
+        with h5py.File(str(self.match_path), "a", libver="latest") as fd:
+            while True:
+                item = self.queue.get()
+                if item is None:
+                    break
+
+                pair, pred = item
+                if pair in fd:
+                    del fd[pair]
+                grp = fd.create_group(pair)
+                matches = pred["matches0"][0].cpu().short().numpy()
+                grp.create_dataset("matches0", data=matches)
+                if "matching_scores0" in pred:
+                    scores = pred["matching_scores0"][0].cpu().half().numpy()
+                    grp.create_dataset("matching_scores0", data=scores)
 
     def put(self, data):
         self.queue.put(data)
+
+    def join(self):
+        self.queue.put(None)
+        super().join()
 
 
 class FeaturePairsDataset(torch.utils.data.Dataset):
@@ -172,20 +182,6 @@ class FeaturePairsDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.pairs)
 
-
-def writer_fn(inp, match_path):
-    pair, pred = inp
-    # Use "r+" which is less aggressive than "a" regarding locks, or retry logic could be added
-    # But disabling locking via env var is the most effective fix for this specific error.
-    with h5py.File(str(match_path), "a", libver="latest") as fd:
-        if pair in fd:
-            del fd[pair]
-        grp = fd.create_group(pair)
-        matches = pred["matches0"][0].cpu().short().numpy()
-        grp.create_dataset("matches0", data=matches)
-        if "matching_scores0" in pred:
-            scores = pred["matching_scores0"][0].cpu().half().numpy()
-            grp.create_dataset("matching_scores0", data=scores)
 
 
 def main(
@@ -272,6 +268,10 @@ def match_from_paths(
     overwrite: bool = False,
 ) -> Path:
     rank, world_size = init_distributed()
+    
+    # Store original match_path for consolidation later
+    original_match_path = match_path
+    
     if world_size > 1:
         match_path = match_path.parent / (
             match_path.stem + f"_rank{rank}" + match_path.suffix
@@ -298,33 +298,68 @@ def match_from_paths(
     pairs = find_unique_new_pairs(pairs, None if overwrite else match_path)
     if len(pairs) == 0:
         logger.info(f"Rank {rank}: Skipping the matching.")
-        return
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        Model = dynamic_load(matchers, conf["model"]["name"])
+        model = Model(conf["model"]).eval().to(device)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    Model = dynamic_load(matchers, conf["model"]["name"])
-    model = Model(conf["model"]).eval().to(device)
+        dataset = FeaturePairsDataset(pairs, feature_path_q, feature_path_ref)
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=5,
+            batch_size=1,
+            shuffle=False,
+            pin_memory=True,
+            # pre_fetch=16,
+        )
+        writer = MatchWriter(match_path, queue_size=16)
 
-    dataset = FeaturePairsDataset(pairs, feature_path_q, feature_path_ref)
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        num_workers=5,
-        batch_size=1,
-        shuffle=False,
-        pin_memory=True,
-        # pre_fetch=16,
-    )
-    writer_queue = WorkQueue(partial(writer_fn, match_path=match_path), 5)
+        try:
+            for idx, data in enumerate(
+                tqdm(loader, smoothing=0.1, disable=rank != 0, desc=f"Rank {rank}")
+            ):
+                data = {
+                    k: v if k.startswith("image") else v.to(device, non_blocking=True)
+                    for k, v in data.items()
+                }
+                pred = model(data)
+                pair = names_to_pair(*pairs[idx])
+                writer.put((pair, pred))
+        finally:
+            writer.join()
 
-    for idx, data in enumerate(tqdm(loader, smoothing=0.1, disable=rank != 0, desc=f"Rank {rank}")):
-        data = {
-            k: v if k.startswith("image") else v.to(device, non_blocking=True)
-            for k, v in data.items()
-        }
-        pred = model(data)
-        pair = names_to_pair(*pairs[idx])
-        writer_queue.put((pair, pred))
-    writer_queue.join()
-    logger.info(f"Rank {rank}: Finished exporting matches.")
+        logger.info(f"Rank {rank}: Finished exporting matches.")
+
+    # Consolidate all rank files into a single file (rank 0 only)
+    if world_size > 1:
+        dist.barrier()  # Wait for all ranks to finish
+        
+        if rank == 0:
+            logger.info("Consolidating match files from all ranks...")
+            
+            # Collect all rank files
+            rank_files = []
+            for r in range(world_size):
+                rank_path = original_match_path.parent / (
+                    original_match_path.stem + f"_rank{r}" + original_match_path.suffix
+                )
+                if rank_path.exists():
+                    rank_files.append(rank_path)
+            
+            # Merge into the original match_path
+            with h5py.File(str(original_match_path), "a", libver="latest") as fd_out:
+                for rank_path in rank_files:
+                    with h5py.File(str(rank_path), "r", libver="latest") as fd_in:
+                        for key in fd_in.keys():
+                            if key in fd_out:
+                                del fd_out[key]
+                            fd_in.copy(key, fd_out)
+                    
+                    # Delete the rank file after merging
+                    rank_path.unlink()
+                    logger.info(f"Merged and removed {rank_path}")
+            
+            logger.info(f"Consolidated all matches into {original_match_path}")
 
 
 if __name__ == "__main__":
