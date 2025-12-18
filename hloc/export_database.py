@@ -22,8 +22,8 @@ def create_empty_db(database_path: Path):
 def main(export_path: Path):
     database = export_path / "database.db"
 
-    logger.info(f"Writing COLMAP logs to {sfm_dir / 'colmap.LOG.*'}")
-    pycolmap.logging.set_log_destination(pycolmap.logging.INFO, sfm_dir / "colmap.LOG.")
+    logger.info(f"Writing COLMAP logs to {export_path / 'colmap.LOG.*'}")
+    pycolmap.logging.set_log_destination(pycolmap.logging.INFO, export_path / "colmap.LOG.")
 
     create_empty_db(database)
     import_images(image_dir, database, camera_mode, image_list, image_options)
